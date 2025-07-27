@@ -41,12 +41,22 @@ app.get("/api/query", async (c) => {
       instructor, 
       min_available_seats, 
       instruction_mode,
-      
-      limit = 10 
+      limit = 10,
+      min_credits,
+      max_credits,
+      level,
+      ethnic_studies,
+      social_science,
+      humanities,
+      biological_science,
+      physical_science,
+      natural_science,
+      literature
     } = c.req.query();
 
     // Build WHERE clause for section filters
     let sectionFilters = [];
+    let courseFilters = [];
     let filterParams = [];
     
     if (status) {
@@ -71,15 +81,60 @@ app.get("/api/query", async (c) => {
       filterParams.push(instruction_mode);
     }
 
-    const whereClause = sectionFilters.length > 0 
-      ? `WHERE ${sectionFilters.join(' AND ')}` 
+    if (min_credits) {
+      courseFilters.push("courses.minimum_credits >= ?");
+      filterParams.push(min_credits);
+    }
+    if (max_credits) {
+      courseFilters.push("courses.maximum_credits <= ?");
+      filterParams.push(max_credits);
+    }
+
+    if (level){
+      courseFilters.push("courses.level = ?");
+      filterParams.push(level);
+    }
+    if(ethnic_studies){
+      courseFilters.push("courses.ethnic_studies = ?");
+      filterParams.push('ETHNIC ST');
+    }
+    if(social_science){
+      courseFilters.push("courses.social_science = ?");
+      filterParams.push('S');
+    }
+    if(humanities){
+      courseFilters.push("courses.humanities = ?");
+      filterParams.push('H');
+    }
+    if(biological_science){
+      courseFilters.push("courses.biological_science = ?");
+      filterParams.push('B');
+    }
+    if(physical_science){
+      courseFilters.push("courses.physical_science = ?");
+      filterParams.push('P');
+    }
+    if(natural_science){
+      courseFilters.push("courses.natural_science = ?");
+      filterParams.push('N');
+    }
+    if(literature){
+      courseFilters.push("courses.literature = ?");
+      filterParams.push('L');
+    }
+
+    let allFilters = [...sectionFilters, ...courseFilters];
+    const whereClause = allFilters.length > 0 
+      ? `WHERE ${allFilters.join(' AND ')}` 
       : '';
+
+    console.log("WHERE CLAUSE:", whereClause);  
 
     // Build the complete SQL with proper parameter handling
     let distinctCoursesSql, queryParams;
     const limitValue = parseInt(limit) || 10; // Ensure it's a valid integer
     
-    if (sectionFilters.length > 0) {
+    if (allFilters.length > 0) {
       // With filters - use parameterized query for filters, direct substitution for LIMIT
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
@@ -88,6 +143,7 @@ app.get("/api/query", async (c) => {
         ${whereClause}
         LIMIT ${limitValue}
       `;
+      console.log("DISTINCT COURSES SQL:", distinctCoursesSql);
       queryParams = filterParams;
     } else {
       // No filters - simple query with direct LIMIT
@@ -143,7 +199,9 @@ app.get("/api/query", async (c) => {
         WHERE course_id IN (${coursePlaceholders}) AND ${sectionFilters.join(' AND ')}
         ORDER BY course_id, status DESC
       `;
-      sectionsParams = [...courseIdList, ...filterParams];
+      // Only pass section filter parameters (course filters already applied in first query)
+      const sectionFilterParams = filterParams.slice(0, sectionFilters.length);
+      sectionsParams = [...courseIdList, ...sectionFilterParams];
     } else {
       // No filters - get all sections
       sectionsSql = `
