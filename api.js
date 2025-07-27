@@ -35,7 +35,7 @@ app.get("/api/query", async (c) => {
   }
 
   try {
-    // Get query parameters for filtering
+    // STEP 1: Get query parameters (including new RMP parameters)
     const { 
       status, 
       instructor, 
@@ -51,22 +51,37 @@ app.get("/api/query", async (c) => {
       biological_science,
       physical_science,
       natural_science,
-      literature
+      literature,
+      min_cumulative_gpa,
+      min_most_recent_gpa,
+      // NEW: RMP-related parameters
+      min_instructor_rating,
+      min_difficulty_rating,
+      min_num_ratings
     } = c.req.query();
 
-    // Build WHERE clause for section filters
+    // STEP 2: Determine if we need to filter by RMP data
+    const hasRMPFilters = !!(
+      min_instructor_rating || 
+      max_instructor_rating || 
+      min_difficulty_rating || 
+      max_difficulty_rating ||
+      min_num_ratings
+    );
+
+    // STEP 3: Build WHERE clause filters
     let sectionFilters = [];
     let courseFilters = [];
+    let rmpFilters = [];
     let filterParams = [];
     
+    // Section filters (existing code)
     if (status) {
-      // Handle multiple statuses separated by commas
       const statusList = status.split(',').map(s => s.trim().toUpperCase());
       if (statusList.length === 1) {
         sectionFilters.push("sections.status = ?");
         filterParams.push(statusList[0]);
       } else {
-        // Multiple statuses - use IN clause
         const statusPlaceholders = statusList.map(() => '?').join(',');
         sectionFilters.push(`sections.status IN (${statusPlaceholders})`);
         filterParams.push(...statusList);
@@ -81,6 +96,7 @@ app.get("/api/query", async (c) => {
       filterParams.push(instruction_mode);
     }
 
+    // Course filters (existing code)
     if (min_credits) {
       courseFilters.push("courses.minimum_credits >= ?");
       filterParams.push(min_credits);
@@ -89,68 +105,97 @@ app.get("/api/query", async (c) => {
       courseFilters.push("courses.maximum_credits <= ?");
       filterParams.push(max_credits);
     }
-
-    if (level){
+    if (level) {
       courseFilters.push("courses.level = ?");
       filterParams.push(level);
     }
-    if(ethnic_studies){
+    if (ethnic_studies) {
       courseFilters.push("courses.ethnic_studies = ?");
       filterParams.push('ETHNIC ST');
     }
-    if(social_science){
+    if (social_science) {
       courseFilters.push("courses.social_science = ?");
       filterParams.push('S');
     }
-    if(humanities){
+    if (humanities) {
       courseFilters.push("courses.humanities = ?");
       filterParams.push('H');
     }
-    if(biological_science){
+    if (biological_science) {
       courseFilters.push("courses.biological_science = ?");
       filterParams.push('B');
     }
-    if(physical_science){
+    if (physical_science) {
       courseFilters.push("courses.physical_science = ?");
       filterParams.push('P');
     }
-    if(natural_science){
+    if (natural_science) {
       courseFilters.push("courses.natural_science = ?");
       filterParams.push('N');
     }
-    if(literature){
+    if (literature) {
       courseFilters.push("courses.literature = ?");
       filterParams.push('L');
     }
+    if (min_cumulative_gpa) {
+      courseFilters.push("madgrades_course_grades.cumulative_gpa >= ?");
+      filterParams.push(min_cumulative_gpa);
+    }
+    if (min_most_recent_gpa) {
+      courseFilters.push("madgrades_course_grades.most_recent_gpa >= ?");
+      filterParams.push(min_most_recent_gpa);
+    }
 
-    let allFilters = [...sectionFilters, ...courseFilters];
+    // NEW: RMP filters
+    if (min_instructor_rating) {
+      rmpFilters.push("rmp_cleaned.avg_rating >= ?");
+      filterParams.push(parseFloat(min_instructor_rating));
+    }
+
+    if (min_difficulty_rating) {
+      rmpFilters.push("rmp_cleaned.avg_difficulty >= ?");
+      filterParams.push(parseFloat(min_difficulty_rating));
+    }
+
+    if (min_num_ratings) {
+      rmpFilters.push("rmp_cleaned.num_ratings >= ?");
+      filterParams.push(parseInt(min_num_ratings));
+    }
+
+    // STEP 4: Combine all filters and build WHERE clause
+    let allFilters = [...sectionFilters, ...courseFilters, ...rmpFilters];
     const whereClause = allFilters.length > 0 
       ? `WHERE ${allFilters.join(' AND ')}` 
       : '';
 
-    console.log("WHERE CLAUSE:", whereClause);  
+    console.log("WHERE CLAUSE:", whereClause);
+    console.log("Has RMP Filters:", hasRMPFilters);
 
-    // Build the complete SQL with proper parameter handling
+    // STEP 5: Determine JOIN type for RMP table
+    const rmpJoinType = hasRMPFilters ? 'JOIN' : 'LEFT JOIN';
+
+    // STEP 6: Build and execute distinct courses query
     let distinctCoursesSql, queryParams;
-    const limitValue = parseInt(limit) || 10; // Ensure it's a valid integer
+    const limitValue = parseInt(limit) || 10;
     
     if (allFilters.length > 0) {
-      // With filters - use parameterized query for filters, direct substitution for LIMIT
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
+        LEFT JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+        ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
         ${whereClause}
         LIMIT ${limitValue}
       `;
-      console.log("DISTINCT COURSES SQL:", distinctCoursesSql);
       queryParams = filterParams;
     } else {
-      // No filters - simple query with direct LIMIT
+      // No filters - always use LEFT JOIN to include all courses
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
+        LEFT JOIN rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
         LIMIT ${limitValue}
       `;
       queryParams = [];
@@ -171,58 +216,154 @@ app.get("/api/query", async (c) => {
       });
     }
 
-    // Get full course details for these course IDs
+    // STEP 7: Get full course details with RMP data
     const courseIdList = courseIds.map(row => row.course_id);
     const coursePlaceholders = courseIdList.map(() => '?').join(',');
     
     const coursesSql = `
-      SELECT course_id, subject_code, course_designation, full_course_designation, 
-             minimum_credits, maximum_credits, ethnic_studies, social_science, 
-             humanities, biological_science, physical_science, natural_science, 
-             literature, level
+      SELECT 
+        courses.course_id, 
+        courses.subject_code, 
+        courses.course_designation, 
+        courses.full_course_designation, 
+        courses.minimum_credits, 
+        courses.maximum_credits, 
+        courses.ethnic_studies, 
+        courses.social_science, 
+        courses.humanities, 
+        courses.biological_science, 
+        courses.physical_science, 
+        courses.natural_science, 
+        courses.literature, 
+        courses.level,
+        madgrades_course_grades.cumulative_gpa, 
+        madgrades_course_grades.most_recent_gpa,
+        AVG(rmp_cleaned.avg_rating) as avg_instructor_rating,
+        AVG(rmp_cleaned.avg_difficulty) as avg_difficulty_rating,
+        COUNT(DISTINCT rmp_cleaned.id) as rated_instructors_count
       FROM courses 
-      WHERE course_id IN (${coursePlaceholders})
-      ORDER BY course_id
+      LEFT JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+      LEFT JOIN sections ON courses.course_id = sections.course_id
+      ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
+      WHERE courses.course_id IN (${coursePlaceholders})
+      GROUP BY courses.course_id, courses.subject_code, courses.course_designation, 
+               courses.full_course_designation, courses.minimum_credits, courses.maximum_credits,
+               courses.ethnic_studies, courses.social_science, courses.humanities, 
+               courses.biological_science, courses.physical_science, courses.natural_science,
+               courses.literature, courses.level, madgrades_course_grades.cumulative_gpa,
+               madgrades_course_grades.most_recent_gpa
+      ORDER BY courses.course_id
     `;
     
     const [coursesResults] = await pool.execute(coursesSql, courseIdList);
     
-    // Get sections for these courses - apply same filters if any exist
+    // STEP 8: Get sections for these courses with conditional filtering
     let sectionsSql, sectionsParams;
     
-    if (sectionFilters.length > 0) {
-      // Apply the same filters to sections query
+    if (sectionFilters.length > 0 || hasRMPFilters) {
       sectionsSql = `
-        SELECT course_id, instructors, status, available_seats, waitlist_total, 
-               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous
+        SELECT 
+          sections.course_id, 
+          sections.instructors, 
+          sections.status, 
+          sections.available_seats, 
+          sections.waitlist_total, 
+          sections.capacity, 
+          sections.enrolled, 
+          sections.meeting_time, 
+          sections.location, 
+          sections.instruction_mode, 
+          sections.is_asynchronous,
+          GROUP_CONCAT(
+            DISTINCT CONCAT(
+              COALESCE(rmp_cleaned.full_name, ''), ':', 
+              COALESCE(rmp_cleaned.avg_rating, 'N/A'), ':', 
+              COALESCE(rmp_cleaned.avg_difficulty, 'N/A'), ':',
+              COALESCE(rmp_cleaned.num_ratings, 'N/A')
+            ) SEPARATOR ';'
+          ) as instructor_ratings
         FROM sections 
-        WHERE course_id IN (${coursePlaceholders}) AND ${sectionFilters.join(' AND ')}
-        ORDER BY course_id, status DESC
+        ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
+        WHERE sections.course_id IN (${coursePlaceholders}) 
+        ${sectionFilters.length > 0 ? `AND ${sectionFilters.join(' AND ')}` : ''}
+        ${rmpFilters.length > 0 ? `AND ${rmpFilters.join(' AND ')}` : ''}
+        GROUP BY sections.course_id, sections.instructors, sections.status, sections.available_seats,
+                 sections.waitlist_total, sections.capacity, sections.enrolled, sections.meeting_time,
+                 sections.location, sections.instruction_mode, sections.is_asynchronous
+        ORDER BY sections.course_id, sections.status DESC
       `;
-      // Only pass section filter parameters (course filters already applied in first query)
-      const sectionFilterParams = filterParams.slice(0, sectionFilters.length);
-      sectionsParams = [...courseIdList, ...sectionFilterParams];
+      
+      // Build parameters for sections query
+      let sectionFilterParams = [];
+      for (let i = 0; i < sectionFilters.length; i++) {
+        sectionFilterParams.push(filterParams[i]);
+      }
+      let rmpFilterParams = [];
+      for (let i = 0; i < rmpFilters.length; i++) {
+        rmpFilterParams.push(filterParams[sectionFilters.length + courseFilters.length + i]);
+      }
+      sectionsParams = [...courseIdList, ...sectionFilterParams, ...rmpFilterParams];
     } else {
-      // No filters - get all sections
+      // No section or RMP filters - use LEFT JOIN to include all sections
       sectionsSql = `
-        SELECT course_id, instructors, status, available_seats, waitlist_total, 
-               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous
+        SELECT 
+          sections.course_id, 
+          sections.instructors, 
+          sections.status, 
+          sections.available_seats, 
+          sections.waitlist_total, 
+          sections.capacity, 
+          sections.enrolled, 
+          sections.meeting_time, 
+          sections.location, 
+          sections.instruction_mode, 
+          sections.is_asynchronous,
+          GROUP_CONCAT(
+            DISTINCT CONCAT(
+              COALESCE(rmp_cleaned.full_name, ''), ':', 
+              COALESCE(rmp_cleaned.avg_rating, 'N/A'), ':', 
+              COALESCE(rmp_cleaned.avg_difficulty, 'N/A'), ':',
+              COALESCE(rmp_cleaned.num_ratings, 'N/A')
+            ) SEPARATOR ';'
+          ) as instructor_ratings
         FROM sections 
-        WHERE course_id IN (${coursePlaceholders})
-        ORDER BY course_id, status DESC
+        LEFT JOIN rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
+        WHERE sections.course_id IN (${coursePlaceholders})
+        GROUP BY sections.course_id, sections.instructors, sections.status, sections.available_seats,
+                 sections.waitlist_total, sections.capacity, sections.enrolled, sections.meeting_time,
+                 sections.location, sections.instruction_mode, sections.is_asynchronous
+        ORDER BY sections.course_id, sections.status DESC
       `;
       sectionsParams = courseIdList;
     }
     
     const [sectionsResults] = await pool.execute(sectionsSql, sectionsParams);
     
-    // Group sections by course_id
+    // STEP 9: Group sections by course_id and parse instructor ratings
     const sectionsByCourse = {};
     if (Array.isArray(sectionsResults)) {
       sectionsResults.forEach(section => {
         if (!sectionsByCourse[section.course_id]) {
           sectionsByCourse[section.course_id] = [];
         }
+        
+        // Parse instructor ratings if they exist
+        let instructorRatingsData = null;
+        if (section.instructor_ratings) {
+          instructorRatingsData = section.instructor_ratings.split(';')
+            .filter(rating => rating && !rating.startsWith(':')) // Filter out empty ratings
+            .map(rating => {
+              const [name, overall, difficulty, numRatings] = rating.split(':');
+              return {
+                name: name || null,
+                avg_rating: overall !== 'N/A' && overall ? parseFloat(overall) : null,
+                avg_difficulty: difficulty !== 'N/A' && difficulty ? parseFloat(difficulty) : null,
+                num_ratings: numRatings !== 'N/A' && numRatings ? parseInt(numRatings) : null
+              };
+            })
+            .filter(rating => rating.name); // Only include ratings with actual instructor names
+        }
+        
         sectionsByCourse[section.course_id].push({
           instructors: section.instructors,
           status: section.status,
@@ -234,16 +375,18 @@ app.get("/api/query", async (c) => {
           location: section.location,
           instruction_mode: section.instruction_mode,
           is_asynchronous: section.is_asynchronous,
+          instructor_ratings: instructorRatingsData
         });
       });
     }
     
-    // Combine courses with their sections
+    // STEP 10: Combine courses with their sections
     const coursesWithSections = coursesResults.map(course => ({
       ...course,
       sections: sectionsByCourse[course.course_id] || []
     }));
 
+    // STEP 11: Return response with filter information
     return c.json({
       data: coursesWithSections,
       count: coursesWithSections.length,
@@ -251,9 +394,14 @@ app.get("/api/query", async (c) => {
         status,
         instructor,
         min_available_seats,
-        instruction_mode
+        instruction_mode,
+        min_instructor_rating,
+        min_difficulty_rating,
+        min_num_ratings,
+        rmp_filtering_active: hasRMPFilters
       }
     });
+
   } catch (error) {
     console.error("Database error:", error);
     return c.json(
