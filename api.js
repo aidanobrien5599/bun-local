@@ -21,9 +21,7 @@ app.use("/*", cors());
 
 app.get("/api/query", async (c) => {
   const apiKey = c.req.header("x-api-key");
-
-
-
+     
   if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
     return c.json(
       {
@@ -37,17 +35,166 @@ app.get("/api/query", async (c) => {
   }
 
   try {
-    const sql = `
-    SELECT courses.course_id, courses.subject_code, courses.course_designation, courses.full_course_designation, courses.minimum_credits, courses.maximum_credits, courses.ethnic_studies, courses.social_science, courses.humanities, courses.biological_science, courses.physical_science, courses.mathematics, courses.computer_science, courses.engineering, courses.business, courses.art, courses.music, courses.theater, courses.dance, courses.other, courses.status, courses.created_at, courses.updated_at,
-    sections.instructors, sections.status, sections.available_seats, sections.waitlist_total, sections.capacity, sections.enrolled, sections.meeting_time, sections.location, sections.instruction_mode, secionts.is_asynchronous
-    FROM courses
-    JOIN sections ON courses.course_id = sections.section_id
-    LIMIT 10
+    // Get query parameters for filtering
+    const { 
+      status, 
+      instructor, 
+      min_available_seats, 
+      instruction_mode,
+      
+      limit = 10 
+    } = c.req.query();
+
+    // Build WHERE clause for section filters
+    let sectionFilters = [];
+    let filterParams = [];
+    
+    if (status) {
+      // Handle multiple statuses separated by commas
+      const statusList = status.split(',').map(s => s.trim().toUpperCase());
+      if (statusList.length === 1) {
+        sectionFilters.push("sections.status = ?");
+        filterParams.push(statusList[0]);
+      } else {
+        // Multiple statuses - use IN clause
+        const statusPlaceholders = statusList.map(() => '?').join(',');
+        sectionFilters.push(`sections.status IN (${statusPlaceholders})`);
+        filterParams.push(...statusList);
+      }
+    }
+    if (instructor) {
+      sectionFilters.push("sections.instructors LIKE ?");
+      filterParams.push(`%${instructor}%`);
+    }
+    if (instruction_mode) {
+      sectionFilters.push("sections.instruction_mode = ?");
+      filterParams.push(instruction_mode);
+    }
+
+    const whereClause = sectionFilters.length > 0 
+      ? `WHERE ${sectionFilters.join(' AND ')}` 
+      : '';
+
+    // Build the complete SQL with proper parameter handling
+    let distinctCoursesSql, queryParams;
+    const limitValue = parseInt(limit) || 10; // Ensure it's a valid integer
+    
+    if (sectionFilters.length > 0) {
+      // With filters - use parameterized query for filters, direct substitution for LIMIT
+      distinctCoursesSql = `
+        SELECT DISTINCT courses.course_id
+        FROM courses
+        JOIN sections ON courses.course_id = sections.course_id
+        ${whereClause}
+        LIMIT ${limitValue}
+      `;
+      queryParams = filterParams;
+    } else {
+      // No filters - simple query with direct LIMIT
+      distinctCoursesSql = `
+        SELECT DISTINCT courses.course_id
+        FROM courses
+        JOIN sections ON courses.course_id = sections.course_id
+        LIMIT ${limitValue}
+      `;
+      queryParams = [];
+    }
+    
+    const [courseIds] = await pool.execute(distinctCoursesSql, queryParams);
+    
+    console.log("=== QUERY DEBUG ===");
+    console.log("SQL:", distinctCoursesSql);
+    console.log("Params:", queryParams);
+    console.log("Params length:", queryParams.length);
+    console.log("==================");
+    
+    if (!Array.isArray(courseIds) || courseIds.length === 0) {
+      return c.json({
+        data: [],
+        count: 0,
+      });
+    }
+
+    // Get full course details for these course IDs
+    const courseIdList = courseIds.map(row => row.course_id);
+    const coursePlaceholders = courseIdList.map(() => '?').join(',');
+    
+    const coursesSql = `
+      SELECT course_id, subject_code, course_designation, full_course_designation, 
+             minimum_credits, maximum_credits, ethnic_studies, social_science, 
+             humanities, biological_science, physical_science, natural_science, 
+             literature, level
+      FROM courses 
+      WHERE course_id IN (${coursePlaceholders})
+      ORDER BY course_id
     `;
-    const [results] = await pool.execute(sql);
+    
+    const [coursesResults] = await pool.execute(coursesSql, courseIdList);
+    
+    // Get sections for these courses - apply same filters if any exist
+    let sectionsSql, sectionsParams;
+    
+    if (sectionFilters.length > 0) {
+      // Apply the same filters to sections query
+      sectionsSql = `
+        SELECT course_id, instructors, status, available_seats, waitlist_total, 
+               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous
+        FROM sections 
+        WHERE course_id IN (${coursePlaceholders}) AND ${sectionFilters.join(' AND ')}
+        ORDER BY course_id, status DESC
+      `;
+      sectionsParams = [...courseIdList, ...filterParams];
+    } else {
+      // No filters - get all sections
+      sectionsSql = `
+        SELECT course_id, instructors, status, available_seats, waitlist_total, 
+               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous
+        FROM sections 
+        WHERE course_id IN (${coursePlaceholders})
+        ORDER BY course_id, status DESC
+      `;
+      sectionsParams = courseIdList;
+    }
+    
+    const [sectionsResults] = await pool.execute(sectionsSql, sectionsParams);
+    
+    // Group sections by course_id
+    const sectionsByCourse = {};
+    if (Array.isArray(sectionsResults)) {
+      sectionsResults.forEach(section => {
+        if (!sectionsByCourse[section.course_id]) {
+          sectionsByCourse[section.course_id] = [];
+        }
+        sectionsByCourse[section.course_id].push({
+          instructors: section.instructors,
+          status: section.status,
+          available_seats: section.available_seats,
+          waitlist_total: section.waitlist_total,
+          capacity: section.capacity,
+          enrolled: section.enrolled,
+          meeting_time: section.meeting_time,
+          location: section.location,
+          instruction_mode: section.instruction_mode,
+          is_asynchronous: section.is_asynchronous,
+        });
+      });
+    }
+    
+    // Combine courses with their sections
+    const coursesWithSections = coursesResults.map(course => ({
+      ...course,
+      sections: sectionsByCourse[course.course_id] || []
+    }));
+
     return c.json({
-      data: results,
-      count: Array.isArray(results) ? results.length : 0,
+      data: coursesWithSections,
+      count: coursesWithSections.length,
+      filters_applied: {
+        status,
+        instructor,
+        min_available_seats,
+        instruction_mode
+      }
     });
   } catch (error) {
     console.error("Database error:", error);
@@ -60,6 +207,7 @@ app.get("/api/query", async (c) => {
     );
   }
 });
+
 
 // Health check endpoint
 app.get("/health", async (c) => {
