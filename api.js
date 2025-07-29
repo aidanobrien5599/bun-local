@@ -418,6 +418,98 @@ app.get("/api/query", async (c) => {
 });
 
 
+
+app.get("/api/debug/rmp", async (c) => {
+  const apiKey = c.req.header("x-api-key");
+  if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    // 1. Check sample instructor names from section_instructors
+    const [instructorSample] = await pool.execute(`
+      SELECT DISTINCT si.instructor_name 
+      FROM section_instructors si 
+      WHERE si.instructor_name IS NOT NULL 
+      LIMIT 10
+    `);
+
+    // 2. Check sample names from rmp_cleaned
+    const [rmpSample] = await pool.execute(`
+      SELECT DISTINCT full_name, avg_rating, avg_difficulty, num_ratings 
+      FROM rmp_cleaned 
+      WHERE full_name IS NOT NULL 
+      LIMIT 10
+    `);
+
+    // 3. Check for exact matches
+    const [exactMatches] = await pool.execute(`
+      SELECT si.instructor_name, rmp.full_name, rmp.avg_rating, rmp.avg_difficulty
+      FROM section_instructors si
+      INNER JOIN rmp_cleaned rmp ON si.instructor_name = rmp.full_name
+      LIMIT 10
+    `);
+
+    // 4. Check specific instructors from your log
+    const [specificCheck] = await pool.execute(`
+      SELECT 
+        'Stephanie Kann' as search_name,
+        rmp.full_name,
+        rmp.avg_rating,
+        rmp.avg_difficulty,
+        rmp.num_ratings,
+        rmp.would_take_again_percent
+      FROM rmp_cleaned rmp 
+      WHERE rmp.full_name LIKE '%Kann%' OR rmp.full_name LIKE '%Stephanie%'
+      
+      UNION ALL
+      
+      SELECT 
+        'Drew Graf' as search_name,
+        rmp.full_name,
+        rmp.avg_rating,
+        rmp.avg_difficulty,
+        rmp.num_ratings,
+        rmp.would_take_again_percent
+      FROM rmp_cleaned rmp 
+      WHERE rmp.full_name LIKE '%Graf%' OR rmp.full_name LIKE '%Drew%'
+    `);
+
+    // 5. Check case sensitivity and whitespace issues
+    const [caseCheck] = await pool.execute(`
+      SELECT 
+        si.instructor_name,
+        LENGTH(si.instructor_name) as instructor_length,
+        rmp.full_name,
+        LENGTH(rmp.full_name) as rmp_length,
+        si.instructor_name = rmp.full_name as exact_match,
+        UPPER(TRIM(si.instructor_name)) = UPPER(TRIM(rmp.full_name)) as case_insensitive_match
+      FROM section_instructors si
+      LEFT JOIN rmp_cleaned rmp ON UPPER(TRIM(si.instructor_name)) = UPPER(TRIM(rmp.full_name))
+      WHERE si.instructor_name IN ('Stephanie Kann', 'Drew Graf', 'Matthew Digman')
+      LIMIT 20
+    `);
+
+    return c.json({
+      instructor_sample: instructorSample,
+      rmp_sample: rmpSample,
+      exact_matches: exactMatches,
+      specific_instructor_check: specificCheck,
+      case_and_whitespace_check: caseCheck,
+      debug_info: {
+        total_instructors: instructorSample.length,
+        total_rmp_records: rmpSample.length,
+        exact_matches_found: exactMatches.length
+      }
+    });
+
+  } catch (error) {
+    console.error("Debug error:", error);
+    return c.json({ error: error.message }, 500);
+  }
+});
+
+
 app.get("/api/query/test", async (c) => {
   const apiKey = c.req.header("x-api-key");
   if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
