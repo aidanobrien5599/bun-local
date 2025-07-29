@@ -37,6 +37,7 @@ app.get("/api/query", async (c) => {
   try {
     // Get query parameters for filtering
     const {
+      search_param,
       status,
       min_available_seats,
       instruction_mode,
@@ -52,12 +53,18 @@ app.get("/api/query", async (c) => {
       natural_science,
       literature,
       min_cumulative_gpa,
-      min_most_recent_gpa
+      min_most_recent_gpa,
+      // New RMP section-level filters
+      min_section_avg_rating,
+      min_section_avg_difficulty,
+      min_section_total_ratings,
+      min_section_avg_would_take_again,
     } = c.req.query();
 
     // Build WHERE clause for section filters
     let sectionFilters = [];
     let courseFilters = [];
+    let rmpSectionFilters = []; // New: for RMP section-level filters
     let filterParams = [];
 
     if (status) {
@@ -79,6 +86,12 @@ app.get("/api/query", async (c) => {
       filterParams.push(instruction_mode);
     }
 
+    if (min_available_seats) {
+      sectionFilters.push("sections.available_seats >= ?");
+      filterParams.push(min_available_seats);
+    }
+
+    // Course-level filters
     if (min_credits) {
       courseFilters.push("courses.minimum_credits >= ?");
       filterParams.push(min_credits);
@@ -131,33 +144,99 @@ app.get("/api/query", async (c) => {
       filterParams.push(min_most_recent_gpa);
     }
 
-    let allFilters = [...sectionFilters, ...courseFilters];
-    const whereClause = allFilters.length > 0
-      ? `WHERE ${allFilters.join(' AND ')}`
-      : '';
+    // New RMP section-level filters
+    if (min_section_avg_rating) {
+      rmpSectionFilters.push("section_rmp_avg.section_avg_rating >= ?");
+      filterParams.push(parseFloat(min_section_avg_rating));
+    }
+    if (min_section_avg_difficulty) {
+      rmpSectionFilters.push("section_rmp_avg.section_avg_difficulty >= ?");
+      filterParams.push(parseFloat(min_section_avg_difficulty));
+    }
+    if (min_section_total_ratings) {
+      rmpSectionFilters.push("section_rmp_avg.section_total_ratings >= ?");
+      filterParams.push(parseInt(min_section_total_ratings));
+    }
+    if (min_section_avg_would_take_again) {
+      rmpSectionFilters.push("section_rmp_avg.section_avg_would_take_again >= ?");
+      filterParams.push(parseFloat(min_section_avg_would_take_again));
+    }
 
-    console.log("WHERE CLAUSE:", whereClause);
+    if (search_param) {
+      courseFilters.push("(courses.course_designation LIKE ? OR courses.full_course_designation LIKE ?)");
+      const searchValue = `%${search_param}%`;
+      filterParams.push(searchValue, searchValue);
+    }
 
-    // Build the complete SQL with proper parameter handling
+    let allFilters = [...sectionFilters, ...courseFilters, ...rmpSectionFilters];
+    
+    console.log("All filters:", allFilters);
+    console.log("Filter params:", filterParams);
+
+    const limitValue = parseInt(limit) || 10;
+
+    // Build the query with RMP section calculations
     let distinctCoursesSql, queryParams;
-    const limitValue = parseInt(limit) || 10; // Ensure it's a valid integer
 
     if (allFilters.length > 0) {
-      // With filters - use parameterized query for filters, direct substitution for LIMIT
+      // Create a CTE (Common Table Expression) to calculate section-level RMP averages
       distinctCoursesSql = `
+        WITH section_rmp_avg AS (
+          SELECT 
+            sections.section_id,
+            sections.course_id,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                    THEN rmp_cleaned.avg_rating * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_rating,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                    THEN rmp_cleaned.avg_difficulty * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_difficulty,
+            SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                ELSE 0 END) as section_total_ratings,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                    THEN rmp_cleaned.would_take_again_percent * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_would_take_again
+          FROM sections
+          LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+          LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
+          GROUP BY sections.section_id, sections.course_id
+        )
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
         JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
-        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
-        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
-        ${whereClause}
+        ${rmpSectionFilters.length > 0 ? 'JOIN section_rmp_avg ON sections.section_id = section_rmp_avg.section_id' : ''}
+        ${allFilters.length > 0 ? `WHERE ${allFilters.join(' AND ')}` : ''}
         LIMIT ${limitValue}
       `;
-      console.log("DISTINCT COURSES SQL:", distinctCoursesSql);
       queryParams = filterParams;
     } else {
-      // No filters - simple query with direct LIMIT
+      // No filters - simple query
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
         FROM courses
@@ -167,13 +246,12 @@ app.get("/api/query", async (c) => {
       queryParams = [];
     }
 
-    const [courseIds] = await pool.execute(distinctCoursesSql, queryParams);
-
-    console.log("=== QUERY DEBUG ===");
+    console.log("=== DISTINCT COURSES QUERY ===");
     console.log("SQL:", distinctCoursesSql);
     console.log("Params:", queryParams);
-    console.log("Params length:", queryParams.length);
-    console.log("==================");
+    console.log("===============================");
+
+    const [courseIds] = await pool.execute(distinctCoursesSql, queryParams);
 
     if (!Array.isArray(courseIds) || courseIds.length === 0) {
       return c.json({
@@ -199,62 +277,93 @@ app.get("/api/query", async (c) => {
 
     const [coursesResults] = await pool.execute(coursesSql, courseIdList);
 
-    // Get sections for these courses - apply same filters if any exist
-    let sectionsSql, sectionsParams;
-
-    if (sectionFilters.length > 0) {
-      // Apply the same filters to sections query
-      sectionsSql = `
-        SELECT course_id, status, available_seats, waitlist_total, 
-               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous, sections.section_id,
-               si.instructor_name, rmp_cleaned.avg_rating, rmp_cleaned.avg_difficulty, rmp_cleaned.num_ratings, rmp_cleaned.would_take_again_percent
-        FROM sections 
+    // Get sections with pre-calculated RMP averages
+    const sectionsWithRmpSql = `
+      WITH section_rmp_avg AS (
+        SELECT 
+          sections.section_id,
+          sections.course_id,
+          sections.status,
+          sections.available_seats,
+          sections.waitlist_total,
+          sections.capacity,
+          sections.enrolled,
+          sections.meeting_time,
+          sections.location,
+          sections.instruction_mode,
+          sections.is_asynchronous,
+          CASE 
+            WHEN COUNT(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL THEN 1 END) > 0 
+            THEN ROUND(
+              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                  THEN rmp_cleaned.avg_rating * COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END) / 
+              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                  THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END), 2)
+            ELSE NULL 
+          END as section_avg_rating,
+          CASE 
+            WHEN COUNT(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL THEN 1 END) > 0 
+            THEN ROUND(
+              SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                  THEN rmp_cleaned.avg_difficulty * COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END) / 
+              SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                  THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END), 2)
+            ELSE NULL 
+          END as section_avg_difficulty,
+          SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+              THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+              ELSE 0 END) as section_total_ratings,
+          CASE 
+            WHEN COUNT(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL THEN 1 END) > 0 
+            THEN ROUND(
+              SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                  THEN rmp_cleaned.would_take_again_percent * COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END) / 
+              SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                  THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END), 2)
+            ELSE NULL 
+          END as section_avg_would_take_again
+        FROM sections
         LEFT JOIN section_instructors si ON sections.section_id = si.section_id
         LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
-        WHERE course_id IN (${coursePlaceholders}) AND ${sectionFilters.join(' AND ')}
-        ORDER BY course_id, status DESC
-      `;
-      // Only pass section filter parameters (course filters already applied in first query)
-      const sectionFilterParams = filterParams.slice(0, sectionFilters.length);
-      sectionsParams = [...courseIdList, ...sectionFilterParams];
-    } else {
-      // No filters - get all sections
-      sectionsSql = `
-        SELECT course_id, status, available_seats, waitlist_total, 
-               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous, sections.section_id,
-               si.instructor_name, rmp_cleaned.avg_rating, rmp_cleaned.avg_difficulty, rmp_cleaned.num_ratings, rmp_cleaned.would_take_again_percent
-        FROM sections 
-        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
-        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
-        WHERE course_id IN (${coursePlaceholders})
-        ORDER BY course_id, status DESC
-      `;
-      sectionsParams = courseIdList;
-    }
+        WHERE sections.course_id IN (${coursePlaceholders})
+        GROUP BY sections.section_id, sections.course_id, sections.status, 
+                 sections.available_seats, sections.waitlist_total, sections.capacity, 
+                 sections.enrolled, sections.meeting_time, sections.location, 
+                 sections.instruction_mode, sections.is_asynchronous
+      )
+      SELECT 
+        sra.*,
+        si.instructor_name,
+        rmp.avg_rating as instructor_avg_rating,
+        rmp.avg_difficulty as instructor_avg_difficulty,
+        rmp.num_ratings as instructor_num_ratings,
+        rmp.would_take_again_percent as instructor_would_take_again_percent
+      FROM section_rmp_avg sra
+      LEFT JOIN section_instructors si ON sra.section_id = si.section_id
+      LEFT JOIN rmp_cleaned rmp ON si.instructor_name = rmp.full_name
+      ORDER BY sra.course_id, sra.status DESC, si.instructor_name
+    `;
 
-    const [sectionsResults] = await pool.execute(sectionsSql, sectionsParams);
+    const [sectionsResults] = await pool.execute(sectionsWithRmpSql, courseIdList);
 
-    console.log("=== SECTIONS RESULTS DEBUG ===");
+    console.log("=== SECTIONS WITH RMP RESULTS ===");
     console.log("Total sections returned:", sectionsResults.length);
     console.log("First few sections:", sectionsResults.slice(0, 3));
-    console.log("================================");
+    console.log("==================================");
 
+    // Group sections by course and section
     const sectionsByCourse = {};
+    
     if (Array.isArray(sectionsResults)) {
-      sectionsResults.forEach((row, index) => {
-        console.log(`Processing row ${index}:`, {
-          course_id: row.course_id,
-          section_id: row.section_id,
-          instructor_name: row.instructor_name,
-          avg_rating: row.avg_rating,
-          avg_difficulty: row.avg_difficulty,
-          num_ratings: row.num_ratings,
-          would_take_again_percent: row.would_take_again_percent
-        });
-
+      sectionsResults.forEach((row) => {
         if (!sectionsByCourse[row.course_id]) {
           sectionsByCourse[row.course_id] = {};
-          console.log(`Created new course entry for course_id: ${row.course_id}`);
         }
 
         // Use section_id as key to group instructors by section
@@ -271,13 +380,12 @@ app.get("/api/query", async (c) => {
             instruction_mode: row.instruction_mode,
             is_asynchronous: row.is_asynchronous,
             instructors: [],
-            // Section-level averages will be calculated after all instructors are added
-            section_avg_rating: null,
-            section_avg_difficulty: null,
-            section_total_ratings: 0,
-            section_avg_would_take_again: null
+            // Pre-calculated section-level averages from SQL
+            section_avg_rating: row.section_avg_rating,
+            section_avg_difficulty: row.section_avg_difficulty,
+            section_total_ratings: row.section_total_ratings,
+            section_avg_would_take_again: row.section_avg_would_take_again
           };
-          console.log(`Created new section entry for section_id: ${row.section_id}`);
         }
 
         // Add instructor if it exists and isn't already added
@@ -288,108 +396,25 @@ app.get("/api/query", async (c) => {
           if (!existingInstructor) {
             const instructorData = {
               name: row.instructor_name,
-              avg_rating: row.avg_rating,
-              avg_difficulty: row.avg_difficulty,
-              num_ratings: row.num_ratings,
-              would_take_again_percent: row.would_take_again_percent
+              avg_rating: row.instructor_avg_rating,
+              avg_difficulty: row.instructor_avg_difficulty,
+              num_ratings: row.instructor_num_ratings,
+              would_take_again_percent: row.instructor_would_take_again_percent
             };
 
-            console.log(`Adding instructor to section ${row.section_id}:`, instructorData);
             sectionsByCourse[row.course_id][row.section_id].instructors.push(instructorData);
-          } else {
-            console.log(`Instructor ${row.instructor_name} already exists for section ${row.section_id}`);
           }
-        } else {
-          console.log(`No instructor name for section ${row.section_id}`);
         }
       });
     }
-
-    console.log("=== SECTIONS BY COURSE BEFORE AVERAGING ===");
-    Object.keys(sectionsByCourse).forEach(courseId => {
-      console.log(`Course ${courseId}:`, Object.keys(sectionsByCourse[courseId]).length, "sections");
-      Object.values(sectionsByCourse[courseId]).forEach(section => {
-        console.log(`  Section ${section.section_id}: ${section.instructors.length} instructors`);
-        section.instructors.forEach(inst => {
-          console.log(`    - ${inst.name}: rating=${inst.avg_rating}, difficulty=${inst.avg_difficulty}, num_ratings=${inst.num_ratings}`);
-        });
-      });
-    });
-
-    // Calculate section-level averages after all instructors have been processed
-    Object.values(sectionsByCourse).forEach(courseSections => {
-      Object.values(courseSections).forEach(section => {
-        console.log(`\n=== CALCULATING AVERAGES FOR SECTION ${section.section_id} ===`);
-        console.log(`Total instructors: ${section.instructors.length}`);
-
-        const instructorsWithRatings = section.instructors.filter(inst => {
-          const hasRating = inst.avg_rating !== null && inst.avg_rating !== undefined;
-          console.log(`Instructor ${inst.name}: has rating = ${hasRating} (rating: ${inst.avg_rating})`);
-          return hasRating;
-        });
-
-        console.log(`Instructors with ratings: ${instructorsWithRatings.length}`);
-
-        if (instructorsWithRatings.length > 0) {
-          // Calculate weighted averages based on number of ratings
-          let totalWeightedRating = 0;
-          let totalWeightedDifficulty = 0;
-          let totalWeightedWouldTakeAgain = 0;
-          let totalRatings = 0;
-          let validWouldTakeAgainCount = 0;
-
-          instructorsWithRatings.forEach(instructor => {
-            const weight = instructor.num_ratings || 1; // Use 1 as minimum weight if num_ratings is null
-            console.log(`Processing instructor ${instructor.name}: weight=${weight}`);
-
-            if (instructor.avg_rating !== null) {
-              totalWeightedRating += instructor.avg_rating * weight;
-              console.log(`  Rating contribution: ${instructor.avg_rating} * ${weight} = ${instructor.avg_rating * weight}`);
-            }
-            if (instructor.avg_difficulty !== null) {
-              totalWeightedDifficulty += instructor.avg_difficulty * weight;
-              console.log(`  Difficulty contribution: ${instructor.avg_difficulty} * ${weight} = ${instructor.avg_difficulty * weight}`);
-            }
-            if (instructor.would_take_again_percent !== null) {
-              totalWeightedWouldTakeAgain += instructor.would_take_again_percent * weight;
-              validWouldTakeAgainCount += weight;
-              console.log(`  Would take again contribution: ${instructor.would_take_again_percent} * ${weight} = ${instructor.would_take_again_percent * weight}`);
-            }
-
-            totalRatings += weight;
-          });
-
-          console.log(`Totals: weighted_rating=${totalWeightedRating}, weighted_difficulty=${totalWeightedDifficulty}, total_ratings=${totalRatings}`);
-
-          // Calculate section averages
-          section.section_avg_rating = totalRatings > 0 ?
-            Math.round((totalWeightedRating / totalRatings) * 100) / 100 : null;
-          section.section_avg_difficulty = totalRatings > 0 ?
-            Math.round((totalWeightedDifficulty / totalRatings) * 100) / 100 : null;
-          section.section_total_ratings = totalRatings;
-          section.section_avg_would_take_again = validWouldTakeAgainCount > 0 ?
-            Math.round((totalWeightedWouldTakeAgain / validWouldTakeAgainCount) * 100) / 100 : null;
-
-          console.log(`Final averages: rating=${section.section_avg_rating}, difficulty=${section.section_avg_difficulty}, total_ratings=${section.section_total_ratings}`);
-        } else {
-          console.log(`No instructors with ratings for section ${section.section_id}`);
-        }
-      });
-    });
 
     // Convert sections object to array for each course
     Object.keys(sectionsByCourse).forEach(courseId => {
       sectionsByCourse[courseId] = Object.values(sectionsByCourse[courseId]);
     });
 
-    console.log("=== FINAL SECTIONS BY COURSE ===");
-    Object.keys(sectionsByCourse).forEach(courseId => {
-      console.log(`Course ${courseId}: ${sectionsByCourse[courseId].length} sections (now as array)`);
-    });
-
-    // Combine courses with their sections (THIS WAS MISSING!)
+    // Combine courses with their sections
     const coursesWithSections = coursesResults.map(course => {
-      console.log(`Mapping course ${course.course_id} with sections:`, sectionsByCourse[course.course_id] ? sectionsByCourse[course.course_id].length : 0);
       return {
         ...course,
         sections: sectionsByCourse[course.course_id] || []
@@ -400,15 +425,22 @@ app.get("/api/query", async (c) => {
     console.log(`Total courses: ${coursesWithSections.length}`);
     coursesWithSections.forEach(course => {
       console.log(`Course ${course.course_id}: ${course.sections.length} sections`);
+      course.sections.forEach(section => {
+        console.log(`  Section ${section.section_id}: rating=${section.section_avg_rating}, difficulty=${section.section_avg_difficulty}, total_ratings=${section.section_total_ratings}`);
+      });
     });
 
     return c.json({
-      data: coursesWithSections, // CHANGED: was returning sectionsByCourse directly
+      data: coursesWithSections,
       count: coursesWithSections.length,
       filters_applied: {
         status,
         min_available_seats,
-        instruction_mode
+        instruction_mode,
+        min_section_avg_rating,
+        min_section_avg_difficulty,
+        min_section_total_ratings,
+        min_section_avg_would_take_again,
       }
     });
   } catch (error) {
@@ -416,8 +448,6 @@ app.get("/api/query", async (c) => {
     return c.json({ error: "Internal server error" }, 500);
   }
 });
-
-
 
 app.get("/api/debug/rmp", async (c) => {
   const apiKey = c.req.header("x-api-key");
@@ -450,56 +480,47 @@ app.get("/api/debug/rmp", async (c) => {
       LIMIT 10
     `);
 
-    // 4. Check specific instructors from your log
-    const [specificCheck] = await pool.execute(`
-      SELECT 
-        'Stephanie Kann' as search_name,
-        rmp.full_name,
-        rmp.avg_rating,
-        rmp.avg_difficulty,
-        rmp.num_ratings,
-        rmp.would_take_again_percent
-      FROM rmp_cleaned rmp 
-      WHERE rmp.full_name LIKE '%Kann%' OR rmp.full_name LIKE '%Stephanie%'
-      
-      UNION ALL
-      
-      SELECT 
-        'Drew Graf' as search_name,
-        rmp.full_name,
-        rmp.avg_rating,
-        rmp.avg_difficulty,
-        rmp.num_ratings,
-        rmp.would_take_again_percent
-      FROM rmp_cleaned rmp 
-      WHERE rmp.full_name LIKE '%Graf%' OR rmp.full_name LIKE '%Drew%'
-    `);
-
-    // 5. Check case sensitivity and whitespace issues
-    const [caseCheck] = await pool.execute(`
-      SELECT 
-        si.instructor_name,
-        LENGTH(si.instructor_name) as instructor_length,
-        rmp.full_name,
-        LENGTH(rmp.full_name) as rmp_length,
-        si.instructor_name = rmp.full_name as exact_match,
-        UPPER(TRIM(si.instructor_name)) = UPPER(TRIM(rmp.full_name)) as case_insensitive_match
-      FROM section_instructors si
-      LEFT JOIN rmp_cleaned rmp ON UPPER(TRIM(si.instructor_name)) = UPPER(TRIM(rmp.full_name))
-      WHERE si.instructor_name IN ('Stephanie Kann', 'Drew Graf', 'Matthew Digman')
-      LIMIT 20
+    // 4. Test the new section-level RMP calculation
+    const [sectionRmpTest] = await pool.execute(`
+      WITH section_rmp_avg AS (
+        SELECT 
+          sections.section_id,
+          sections.course_id,
+          CASE 
+            WHEN COUNT(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL THEN 1 END) > 0 
+            THEN ROUND(
+              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                  THEN rmp_cleaned.avg_rating * COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END) / 
+              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                  THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                  ELSE 0 END), 2)
+            ELSE NULL 
+          END as section_avg_rating,
+          SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+              THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+              ELSE 0 END) as section_total_ratings
+        FROM sections
+        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
+        GROUP BY sections.section_id, sections.course_id
+        HAVING section_avg_rating IS NOT NULL
+      )
+      SELECT * FROM section_rmp_avg 
+      WHERE section_avg_rating >= 3.0 
+      LIMIT 10
     `);
 
     return c.json({
       instructor_sample: instructorSample,
       rmp_sample: rmpSample,
       exact_matches: exactMatches,
-      specific_instructor_check: specificCheck,
-      case_and_whitespace_check: caseCheck,
+      section_rmp_calculation_test: sectionRmpTest,
       debug_info: {
         total_instructors: instructorSample.length,
         total_rmp_records: rmpSample.length,
-        exact_matches_found: exactMatches.length
+        exact_matches_found: exactMatches.length,
+        sections_with_rmp_data: sectionRmpTest.length
       }
     });
 
@@ -508,7 +529,6 @@ app.get("/api/debug/rmp", async (c) => {
     return c.json({ error: error.message }, 500);
   }
 });
-
 
 app.get("/api/query/test", async (c) => {
   const apiKey = c.req.header("x-api-key");
