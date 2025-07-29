@@ -21,7 +21,7 @@ app.use("/*", cors());
 
 app.get("/api/query", async (c) => {
   const apiKey = c.req.header("x-api-key");
-     
+
   if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
     return c.json(
       {
@@ -35,11 +35,10 @@ app.get("/api/query", async (c) => {
   }
 
   try {
-    // STEP 1: Get query parameters (including new RMP parameters)
-    const { 
-      status, 
-      instructor, 
-      min_available_seats, 
+    // Get query parameters for filtering
+    const {
+      status,
+      min_available_seats,
       instruction_mode,
       limit = 10,
       min_credits,
@@ -53,50 +52,33 @@ app.get("/api/query", async (c) => {
       natural_science,
       literature,
       min_cumulative_gpa,
-      min_most_recent_gpa,
-      // NEW: RMP-related parameters
-      min_instructor_rating,
-      min_difficulty_rating,
-      min_num_ratings
+      min_most_recent_gpa
     } = c.req.query();
 
-    // STEP 2: Determine if we need to filter by RMP data
-    const hasRMPFilters = !!(
-      min_instructor_rating || 
-      max_instructor_rating || 
-      min_difficulty_rating || 
-      max_difficulty_rating ||
-      min_num_ratings
-    );
-
-    // STEP 3: Build WHERE clause filters
+    // Build WHERE clause for section filters
     let sectionFilters = [];
     let courseFilters = [];
-    let rmpFilters = [];
     let filterParams = [];
-    
-    // Section filters (existing code)
+
     if (status) {
+      // Handle multiple statuses separated by commas
       const statusList = status.split(',').map(s => s.trim().toUpperCase());
       if (statusList.length === 1) {
         sectionFilters.push("sections.status = ?");
         filterParams.push(statusList[0]);
       } else {
+        // Multiple statuses - use IN clause
         const statusPlaceholders = statusList.map(() => '?').join(',');
         sectionFilters.push(`sections.status IN (${statusPlaceholders})`);
         filterParams.push(...statusList);
       }
     }
-    if (instructor) {
-      sectionFilters.push("sections.instructors LIKE ?");
-      filterParams.push(`%${instructor}%`);
-    }
+
     if (instruction_mode) {
       sectionFilters.push("sections.instruction_mode = ?");
       filterParams.push(instruction_mode);
     }
 
-    // Course filters (existing code)
     if (min_credits) {
       courseFilters.push("courses.minimum_credits >= ?");
       filterParams.push(min_credits);
@@ -105,6 +87,7 @@ app.get("/api/query", async (c) => {
       courseFilters.push("courses.maximum_credits <= ?");
       filterParams.push(max_credits);
     }
+
     if (level) {
       courseFilters.push("courses.level = ?");
       filterParams.push(level);
@@ -137,78 +120,61 @@ app.get("/api/query", async (c) => {
       courseFilters.push("courses.literature = ?");
       filterParams.push('L');
     }
+
     if (min_cumulative_gpa) {
       courseFilters.push("madgrades_course_grades.cumulative_gpa >= ?");
       filterParams.push(min_cumulative_gpa);
     }
+
     if (min_most_recent_gpa) {
       courseFilters.push("madgrades_course_grades.most_recent_gpa >= ?");
       filterParams.push(min_most_recent_gpa);
     }
 
-    // NEW: RMP filters
-    if (min_instructor_rating) {
-      rmpFilters.push("rmp_cleaned.avg_rating >= ?");
-      filterParams.push(parseFloat(min_instructor_rating));
-    }
-
-    if (min_difficulty_rating) {
-      rmpFilters.push("rmp_cleaned.avg_difficulty >= ?");
-      filterParams.push(parseFloat(min_difficulty_rating));
-    }
-
-    if (min_num_ratings) {
-      rmpFilters.push("rmp_cleaned.num_ratings >= ?");
-      filterParams.push(parseInt(min_num_ratings));
-    }
-
-    // STEP 4: Combine all filters and build WHERE clause
-    let allFilters = [...sectionFilters, ...courseFilters, ...rmpFilters];
-    const whereClause = allFilters.length > 0 
-      ? `WHERE ${allFilters.join(' AND ')}` 
+    let allFilters = [...sectionFilters, ...courseFilters];
+    const whereClause = allFilters.length > 0
+      ? `WHERE ${allFilters.join(' AND ')}`
       : '';
 
     console.log("WHERE CLAUSE:", whereClause);
-    console.log("Has RMP Filters:", hasRMPFilters);
 
-    // STEP 5: Determine JOIN type for RMP table
-    const rmpJoinType = hasRMPFilters ? 'JOIN' : 'LEFT JOIN';
-
-    // STEP 6: Build and execute distinct courses query
+    // Build the complete SQL with proper parameter handling
     let distinctCoursesSql, queryParams;
-    const limitValue = parseInt(limit) || 10;
-    
+    const limitValue = parseInt(limit) || 10; // Ensure it's a valid integer
+
     if (allFilters.length > 0) {
+      // With filters - use parameterized query for filters, direct substitution for LIMIT
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
-        LEFT JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
-        ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
+        JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
         ${whereClause}
         LIMIT ${limitValue}
       `;
+      console.log("DISTINCT COURSES SQL:", distinctCoursesSql);
       queryParams = filterParams;
     } else {
-      // No filters - always use LEFT JOIN to include all courses
+      // No filters - simple query with direct LIMIT
       distinctCoursesSql = `
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
-        LEFT JOIN rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
         LIMIT ${limitValue}
       `;
       queryParams = [];
     }
-    
+
     const [courseIds] = await pool.execute(distinctCoursesSql, queryParams);
-    
+
     console.log("=== QUERY DEBUG ===");
     console.log("SQL:", distinctCoursesSql);
     console.log("Params:", queryParams);
     console.log("Params length:", queryParams.length);
     console.log("==================");
-    
+
     if (!Array.isArray(courseIds) || courseIds.length === 0) {
       return c.json({
         data: [],
@@ -216,204 +182,249 @@ app.get("/api/query", async (c) => {
       });
     }
 
-    // STEP 7: Get full course details with RMP data
+    // Get full course details for these course IDs
     const courseIdList = courseIds.map(row => row.course_id);
     const coursePlaceholders = courseIdList.map(() => '?').join(',');
-    
+
     const coursesSql = `
-      SELECT 
-        courses.course_id, 
-        courses.subject_code, 
-        courses.course_designation, 
-        courses.full_course_designation, 
-        courses.minimum_credits, 
-        courses.maximum_credits, 
-        courses.ethnic_studies, 
-        courses.social_science, 
-        courses.humanities, 
-        courses.biological_science, 
-        courses.physical_science, 
-        courses.natural_science, 
-        courses.literature, 
-        courses.level,
-        madgrades_course_grades.cumulative_gpa, 
-        madgrades_course_grades.most_recent_gpa,
-        AVG(rmp_cleaned.avg_rating) as avg_instructor_rating,
-        AVG(rmp_cleaned.avg_difficulty) as avg_difficulty_rating,
-        COUNT(DISTINCT rmp_cleaned.id) as rated_instructors_count
+      SELECT course_id, subject_code, course_designation, full_course_designation, 
+             minimum_credits, maximum_credits, ethnic_studies, social_science, 
+             humanities, biological_science, physical_science, natural_science, 
+             literature, level, madgrades_course_grades.cumulative_gpa, madgrades_course_grades.most_recent_gpa
       FROM courses 
-      LEFT JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
-      LEFT JOIN sections ON courses.course_id = sections.course_id
-      ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
-      WHERE courses.course_id IN (${coursePlaceholders})
-      GROUP BY courses.course_id, courses.subject_code, courses.course_designation, 
-               courses.full_course_designation, courses.minimum_credits, courses.maximum_credits,
-               courses.ethnic_studies, courses.social_science, courses.humanities, 
-               courses.biological_science, courses.physical_science, courses.natural_science,
-               courses.literature, courses.level, madgrades_course_grades.cumulative_gpa,
-               madgrades_course_grades.most_recent_gpa
-      ORDER BY courses.course_id
+      JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+      WHERE course_id IN (${coursePlaceholders})
+      ORDER BY course_id
     `;
-    
+
     const [coursesResults] = await pool.execute(coursesSql, courseIdList);
-    
-    // STEP 8: Get sections for these courses with conditional filtering
+
+    // Get sections for these courses - apply same filters if any exist
     let sectionsSql, sectionsParams;
-    
-    if (sectionFilters.length > 0 || hasRMPFilters) {
+
+    if (sectionFilters.length > 0) {
+      // Apply the same filters to sections query
       sectionsSql = `
-        SELECT 
-          sections.course_id, 
-          sections.instructors, 
-          sections.status, 
-          sections.available_seats, 
-          sections.waitlist_total, 
-          sections.capacity, 
-          sections.enrolled, 
-          sections.meeting_time, 
-          sections.location, 
-          sections.instruction_mode, 
-          sections.is_asynchronous,
-          GROUP_CONCAT(
-            DISTINCT CONCAT(
-              COALESCE(rmp_cleaned.full_name, ''), ':', 
-              COALESCE(rmp_cleaned.avg_rating, 'N/A'), ':', 
-              COALESCE(rmp_cleaned.avg_difficulty, 'N/A'), ':',
-              COALESCE(rmp_cleaned.num_ratings, 'N/A')
-            ) SEPARATOR ';'
-          ) as instructor_ratings
+        SELECT course_id, status, available_seats, waitlist_total, 
+               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous, sections.section_id,
+               si.instructor_name, rmp_cleaned.avg_rating, rmp_cleaned.avg_difficulty, rmp_cleaned.num_ratings, rmp_cleaned.would_take_again_percent
         FROM sections 
-        ${rmpJoinType} rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
-        WHERE sections.course_id IN (${coursePlaceholders}) 
-        ${sectionFilters.length > 0 ? `AND ${sectionFilters.join(' AND ')}` : ''}
-        ${rmpFilters.length > 0 ? `AND ${rmpFilters.join(' AND ')}` : ''}
-        GROUP BY sections.course_id, sections.instructors, sections.status, sections.available_seats,
-                 sections.waitlist_total, sections.capacity, sections.enrolled, sections.meeting_time,
-                 sections.location, sections.instruction_mode, sections.is_asynchronous
-        ORDER BY sections.course_id, sections.status DESC
+        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
+        WHERE course_id IN (${coursePlaceholders}) AND ${sectionFilters.join(' AND ')}
+        ORDER BY course_id, status DESC
       `;
-      
-      // Build parameters for sections query
-      let sectionFilterParams = [];
-      for (let i = 0; i < sectionFilters.length; i++) {
-        sectionFilterParams.push(filterParams[i]);
-      }
-      let rmpFilterParams = [];
-      for (let i = 0; i < rmpFilters.length; i++) {
-        rmpFilterParams.push(filterParams[sectionFilters.length + courseFilters.length + i]);
-      }
-      sectionsParams = [...courseIdList, ...sectionFilterParams, ...rmpFilterParams];
+      // Only pass section filter parameters (course filters already applied in first query)
+      const sectionFilterParams = filterParams.slice(0, sectionFilters.length);
+      sectionsParams = [...courseIdList, ...sectionFilterParams];
     } else {
-      // No section or RMP filters - use LEFT JOIN to include all sections
+      // No filters - get all sections
       sectionsSql = `
-        SELECT 
-          sections.course_id, 
-          sections.instructors, 
-          sections.status, 
-          sections.available_seats, 
-          sections.waitlist_total, 
-          sections.capacity, 
-          sections.enrolled, 
-          sections.meeting_time, 
-          sections.location, 
-          sections.instruction_mode, 
-          sections.is_asynchronous,
-          GROUP_CONCAT(
-            DISTINCT CONCAT(
-              COALESCE(rmp_cleaned.full_name, ''), ':', 
-              COALESCE(rmp_cleaned.avg_rating, 'N/A'), ':', 
-              COALESCE(rmp_cleaned.avg_difficulty, 'N/A'), ':',
-              COALESCE(rmp_cleaned.num_ratings, 'N/A')
-            ) SEPARATOR ';'
-          ) as instructor_ratings
+        SELECT course_id, status, available_seats, waitlist_total, 
+               capacity, enrolled, meeting_time, location, instruction_mode, is_asynchronous, sections.section_id,
+               si.instructor_name, rmp_cleaned.avg_rating, rmp_cleaned.avg_difficulty, rmp_cleaned.num_ratings, rmp_cleaned.would_take_again_percent
         FROM sections 
-        LEFT JOIN rmp_cleaned ON FIND_IN_SET(TRIM(rmp_cleaned.full_name), REPLACE(sections.instructors, ', ', ',')) > 0
-        WHERE sections.course_id IN (${coursePlaceholders})
-        GROUP BY sections.course_id, sections.instructors, sections.status, sections.available_seats,
-                 sections.waitlist_total, sections.capacity, sections.enrolled, sections.meeting_time,
-                 sections.location, sections.instruction_mode, sections.is_asynchronous
-        ORDER BY sections.course_id, sections.status DESC
+        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
+        WHERE course_id IN (${coursePlaceholders})
+        ORDER BY course_id, status DESC
       `;
       sectionsParams = courseIdList;
     }
-    
+
     const [sectionsResults] = await pool.execute(sectionsSql, sectionsParams);
-    
-    // STEP 9: Group sections by course_id and parse instructor ratings
+
+    console.log("=== SECTIONS RESULTS DEBUG ===");
+    console.log("Total sections returned:", sectionsResults.length);
+    console.log("First few sections:", sectionsResults.slice(0, 3));
+    console.log("================================");
+
     const sectionsByCourse = {};
     if (Array.isArray(sectionsResults)) {
-      sectionsResults.forEach(section => {
-        if (!sectionsByCourse[section.course_id]) {
-          sectionsByCourse[section.course_id] = [];
-        }
-        
-        // Parse instructor ratings if they exist
-        let instructorRatingsData = null;
-        if (section.instructor_ratings) {
-          instructorRatingsData = section.instructor_ratings.split(';')
-            .filter(rating => rating && !rating.startsWith(':')) // Filter out empty ratings
-            .map(rating => {
-              const [name, overall, difficulty, numRatings] = rating.split(':');
-              return {
-                name: name || null,
-                avg_rating: overall !== 'N/A' && overall ? parseFloat(overall) : null,
-                avg_difficulty: difficulty !== 'N/A' && difficulty ? parseFloat(difficulty) : null,
-                num_ratings: numRatings !== 'N/A' && numRatings ? parseInt(numRatings) : null
-              };
-            })
-            .filter(rating => rating.name); // Only include ratings with actual instructor names
-        }
-        
-        sectionsByCourse[section.course_id].push({
-          instructors: section.instructors,
-          status: section.status,
-          available_seats: section.available_seats,
-          waitlist_total: section.waitlist_total,
-          capacity: section.capacity,
-          enrolled: section.enrolled,
-          meeting_time: section.meeting_time,
-          location: section.location,
-          instruction_mode: section.instruction_mode,
-          is_asynchronous: section.is_asynchronous,
-          instructor_ratings: instructorRatingsData
+      sectionsResults.forEach((row, index) => {
+        console.log(`Processing row ${index}:`, {
+          course_id: row.course_id,
+          section_id: row.section_id,
+          instructor_name: row.instructor_name,
+          avg_rating: row.avg_rating,
+          avg_difficulty: row.avg_difficulty,
+          num_ratings: row.num_ratings,
+          would_take_again_percent: row.would_take_again_percent
         });
+
+        if (!sectionsByCourse[row.course_id]) {
+          sectionsByCourse[row.course_id] = {};
+          console.log(`Created new course entry for course_id: ${row.course_id}`);
+        }
+
+        // Use section_id as key to group instructors by section
+        if (!sectionsByCourse[row.course_id][row.section_id]) {
+          sectionsByCourse[row.course_id][row.section_id] = {
+            section_id: row.section_id,
+            status: row.status,
+            available_seats: row.available_seats,
+            waitlist_total: row.waitlist_total,
+            capacity: row.capacity,
+            enrolled: row.enrolled,
+            meeting_time: row.meeting_time,
+            location: row.location,
+            instruction_mode: row.instruction_mode,
+            is_asynchronous: row.is_asynchronous,
+            instructors: [],
+            // Section-level averages will be calculated after all instructors are added
+            section_avg_rating: null,
+            section_avg_difficulty: null,
+            section_total_ratings: 0,
+            section_avg_would_take_again: null
+          };
+          console.log(`Created new section entry for section_id: ${row.section_id}`);
+        }
+
+        // Add instructor if it exists and isn't already added
+        if (row.instructor_name) {
+          const existingInstructor = sectionsByCourse[row.course_id][row.section_id].instructors
+            .find(inst => inst.name === row.instructor_name);
+
+          if (!existingInstructor) {
+            const instructorData = {
+              name: row.instructor_name,
+              avg_rating: row.avg_rating,
+              avg_difficulty: row.avg_difficulty,
+              num_ratings: row.num_ratings,
+              would_take_again_percent: row.would_take_again_percent
+            };
+
+            console.log(`Adding instructor to section ${row.section_id}:`, instructorData);
+            sectionsByCourse[row.course_id][row.section_id].instructors.push(instructorData);
+          } else {
+            console.log(`Instructor ${row.instructor_name} already exists for section ${row.section_id}`);
+          }
+        } else {
+          console.log(`No instructor name for section ${row.section_id}`);
+        }
       });
     }
-    
-    // STEP 10: Combine courses with their sections
-    const coursesWithSections = coursesResults.map(course => ({
-      ...course,
-      sections: sectionsByCourse[course.course_id] || []
-    }));
 
-    // STEP 11: Return response with filter information
+    console.log("=== SECTIONS BY COURSE BEFORE AVERAGING ===");
+    Object.keys(sectionsByCourse).forEach(courseId => {
+      console.log(`Course ${courseId}:`, Object.keys(sectionsByCourse[courseId]).length, "sections");
+      Object.values(sectionsByCourse[courseId]).forEach(section => {
+        console.log(`  Section ${section.section_id}: ${section.instructors.length} instructors`);
+        section.instructors.forEach(inst => {
+          console.log(`    - ${inst.name}: rating=${inst.avg_rating}, difficulty=${inst.avg_difficulty}, num_ratings=${inst.num_ratings}`);
+        });
+      });
+    });
+
+    // Calculate section-level averages after all instructors have been processed
+    Object.values(sectionsByCourse).forEach(courseSections => {
+      Object.values(courseSections).forEach(section => {
+        console.log(`\n=== CALCULATING AVERAGES FOR SECTION ${section.section_id} ===`);
+        console.log(`Total instructors: ${section.instructors.length}`);
+
+        const instructorsWithRatings = section.instructors.filter(inst => {
+          const hasRating = inst.avg_rating !== null && inst.avg_rating !== undefined;
+          console.log(`Instructor ${inst.name}: has rating = ${hasRating} (rating: ${inst.avg_rating})`);
+          return hasRating;
+        });
+
+        console.log(`Instructors with ratings: ${instructorsWithRatings.length}`);
+
+        if (instructorsWithRatings.length > 0) {
+          // Calculate weighted averages based on number of ratings
+          let totalWeightedRating = 0;
+          let totalWeightedDifficulty = 0;
+          let totalWeightedWouldTakeAgain = 0;
+          let totalRatings = 0;
+          let validWouldTakeAgainCount = 0;
+
+          instructorsWithRatings.forEach(instructor => {
+            const weight = instructor.num_ratings || 1; // Use 1 as minimum weight if num_ratings is null
+            console.log(`Processing instructor ${instructor.name}: weight=${weight}`);
+
+            if (instructor.avg_rating !== null) {
+              totalWeightedRating += instructor.avg_rating * weight;
+              console.log(`  Rating contribution: ${instructor.avg_rating} * ${weight} = ${instructor.avg_rating * weight}`);
+            }
+            if (instructor.avg_difficulty !== null) {
+              totalWeightedDifficulty += instructor.avg_difficulty * weight;
+              console.log(`  Difficulty contribution: ${instructor.avg_difficulty} * ${weight} = ${instructor.avg_difficulty * weight}`);
+            }
+            if (instructor.would_take_again_percent !== null) {
+              totalWeightedWouldTakeAgain += instructor.would_take_again_percent * weight;
+              validWouldTakeAgainCount += weight;
+              console.log(`  Would take again contribution: ${instructor.would_take_again_percent} * ${weight} = ${instructor.would_take_again_percent * weight}`);
+            }
+
+            totalRatings += weight;
+          });
+
+          console.log(`Totals: weighted_rating=${totalWeightedRating}, weighted_difficulty=${totalWeightedDifficulty}, total_ratings=${totalRatings}`);
+
+          // Calculate section averages
+          section.section_avg_rating = totalRatings > 0 ?
+            Math.round((totalWeightedRating / totalRatings) * 100) / 100 : null;
+          section.section_avg_difficulty = totalRatings > 0 ?
+            Math.round((totalWeightedDifficulty / totalRatings) * 100) / 100 : null;
+          section.section_total_ratings = totalRatings;
+          section.section_avg_would_take_again = validWouldTakeAgainCount > 0 ?
+            Math.round((totalWeightedWouldTakeAgain / validWouldTakeAgainCount) * 100) / 100 : null;
+
+          console.log(`Final averages: rating=${section.section_avg_rating}, difficulty=${section.section_avg_difficulty}, total_ratings=${section.section_total_ratings}`);
+        } else {
+          console.log(`No instructors with ratings for section ${section.section_id}`);
+        }
+      });
+    });
+
+    // Convert sections object to array for each course
+    Object.keys(sectionsByCourse).forEach(courseId => {
+      sectionsByCourse[courseId] = Object.values(sectionsByCourse[courseId]);
+    });
+
+    console.log("=== FINAL SECTIONS BY COURSE ===");
+    Object.keys(sectionsByCourse).forEach(courseId => {
+      console.log(`Course ${courseId}: ${sectionsByCourse[courseId].length} sections (now as array)`);
+    });
+
+    // Combine courses with their sections (THIS WAS MISSING!)
+    const coursesWithSections = coursesResults.map(course => {
+      console.log(`Mapping course ${course.course_id} with sections:`, sectionsByCourse[course.course_id] ? sectionsByCourse[course.course_id].length : 0);
+      return {
+        ...course,
+        sections: sectionsByCourse[course.course_id] || []
+      };
+    });
+
+    console.log("=== FINAL COURSES WITH SECTIONS ===");
+    console.log(`Total courses: ${coursesWithSections.length}`);
+    coursesWithSections.forEach(course => {
+      console.log(`Course ${course.course_id}: ${course.sections.length} sections`);
+    });
+
     return c.json({
-      data: coursesWithSections,
+      data: coursesWithSections, // CHANGED: was returning sectionsByCourse directly
       count: coursesWithSections.length,
       filters_applied: {
         status,
-        instructor,
         min_available_seats,
-        instruction_mode,
-        min_instructor_rating,
-        min_difficulty_rating,
-        min_num_ratings,
-        rmp_filtering_active: hasRMPFilters
+        instruction_mode
       }
     });
-
   } catch (error) {
-    console.error("Database error:", error);
-    return c.json(
-      {
-        error: "Database query failed",
-        details: error instanceof Error ? error.message : "Unknown error",
-      },
-      500
-    );
+    console.error("Error in /api/query:", error);
+    return c.json({ error: "Internal server error" }, 500);
   }
 });
 
+
+app.get("/api/query/test", async (c) => {
+  const apiKey = c.req.header("x-api-key");
+  if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  
+});
 
 // Health check endpoint
 app.get("/health", async (c) => {
