@@ -180,8 +180,71 @@ app.get("/api/query", async (c) => {
 
     const limitValue = parseInt(limit) || 10;
 
+
+      let totalCountSql = `
+     WITH section_rmp_avg AS (
+          SELECT 
+            sections.section_id,
+            sections.course_id,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                    THEN rmp_cleaned.avg_rating * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_rating,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                    THEN rmp_cleaned.avg_difficulty * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.avg_difficulty IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_difficulty,
+            SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+                THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                ELSE 0 END) as section_total_ratings,
+            CASE 
+              WHEN COUNT(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL THEN 1 END) > 0 
+              THEN ROUND(
+                SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                    THEN rmp_cleaned.would_take_again_percent * COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END) / 
+                SUM(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL 
+                    THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+                    ELSE 0 END), 2)
+              ELSE NULL 
+            END as section_avg_would_take_again
+          FROM sections
+          LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+          LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
+          GROUP BY sections.section_id, sections.course_id
+        )
+    SELECT COUNT(DISTINCT courses.course_id) AS total
+    FROM courses
+    JOIN sections ON courses.course_id = sections.course_id
+    JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+    LEFT JOIN section_instructors si ON sections.section_id = si.section_id
+    ${rmpSectionFilters.length > 0 ? 'JOIN section_rmp_avg ON sections.section_id = section_rmp_avg.section_id' : ''}
+    ${allFilters.length > 0 ? `WHERE ${allFilters.join(' AND ')}` : ''}
+  `;
+
+    const [countRows] = await pool.execute(totalCountSql, filterParams);
+    const totalCount = countRows?.[0]?.total ?? 0;
+    const hasMore = offset + limitValue < totalCount;
+
     // Build the query with RMP section calculations
     let distinctCoursesSql, queryParams;
+  
+
+    
 
     if (allFilters.length > 0) {
       // Create a CTE (Common Table Expression) to calculate section-level RMP averages
@@ -443,6 +506,8 @@ app.get("/api/query", async (c) => {
     return c.json({
       data: coursesWithSections,
       count: coursesWithSections.length,
+      total_count: totalCount,
+      has_more: hasMore,
       filters_applied: {
         status,
         min_available_seats,
