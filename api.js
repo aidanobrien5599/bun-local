@@ -59,6 +59,7 @@ app.get("/api/query", async (c) => {
       min_section_avg_difficulty,
       min_section_total_ratings,
       min_section_avg_would_take_again,
+      page = 1
     } = c.req.query();
 
     // Build WHERE clause for section filters
@@ -162,11 +163,15 @@ app.get("/api/query", async (c) => {
       filterParams.push(parseFloat(min_section_avg_would_take_again));
     }
 
+    
+
     if (search_param) {
-      courseFilters.push("(courses.course_designation LIKE ? OR courses.full_course_designation LIKE ?)");
+      courseFilters.push("(courses.course_designation LIKE ? OR courses.full_course_designation LIKE ? OR si.instructor_name LIKE ?)");
       const searchValue = `%${search_param}%`;
-      filterParams.push(searchValue, searchValue);
+      filterParams.push(searchValue, searchValue, searchValue);
     }
+
+    const offset = (page - 1) * limit;
 
     let allFilters = [...sectionFilters, ...courseFilters, ...rmpSectionFilters];
     
@@ -230,9 +235,10 @@ app.get("/api/query", async (c) => {
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
         JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
+        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
         ${rmpSectionFilters.length > 0 ? 'JOIN section_rmp_avg ON sections.section_id = section_rmp_avg.section_id' : ''}
         ${allFilters.length > 0 ? `WHERE ${allFilters.join(' AND ')}` : ''}
-        LIMIT ${limitValue}
+        LIMIT ${limitValue} OFFSET ${offset}
       `;
       queryParams = filterParams;
     } else {
@@ -241,7 +247,7 @@ app.get("/api/query", async (c) => {
         SELECT DISTINCT courses.course_id
         FROM courses
         JOIN sections ON courses.course_id = sections.course_id
-        LIMIT ${limitValue}
+        LIMIT ${limitValue} OFFSET ${offset}
       `;
       queryParams = [];
     }
@@ -268,7 +274,11 @@ app.get("/api/query", async (c) => {
       SELECT course_id, subject_code, course_designation, full_course_designation, 
              minimum_credits, maximum_credits, ethnic_studies, social_science, 
              humanities, biological_science, physical_science, natural_science, 
-             literature, level, madgrades_course_grades.cumulative_gpa, madgrades_course_grades.most_recent_gpa
+             literature, level, 
+               CAST(madgrades_course_grades.cumulative_gpa AS FLOAT) AS cumulative_gpa,
+              CAST(madgrades_course_grades.most_recent_gpa AS FLOAT) AS most_recent_gpa,
+              CAST(madgrades_course_grades.most_recent_gpa AS FLOAT) AS most_recent_gpa
+
       FROM courses 
       JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
       WHERE course_id IN (${coursePlaceholders})
@@ -314,9 +324,9 @@ app.get("/api/query", async (c) => {
                   ELSE 0 END), 2)
             ELSE NULL 
           END as section_avg_difficulty,
-          SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
-              THEN COALESCE(rmp_cleaned.num_ratings, 1) 
-              ELSE 0 END) as section_total_ratings,
+          CAST(SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
+            THEN COALESCE(rmp_cleaned.num_ratings, 1) 
+            ELSE 0 END) AS UNSIGNED) AS section_total_ratings,
           CASE 
             WHEN COUNT(CASE WHEN rmp_cleaned.would_take_again_percent IS NOT NULL THEN 1 END) > 0 
             THEN ROUND(
@@ -447,95 +457,6 @@ app.get("/api/query", async (c) => {
     console.error("Error in /api/query:", error);
     return c.json({ error: "Internal server error" }, 500);
   }
-});
-
-app.get("/api/debug/rmp", async (c) => {
-  const apiKey = c.req.header("x-api-key");
-  if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  try {
-    // 1. Check sample instructor names from section_instructors
-    const [instructorSample] = await pool.execute(`
-      SELECT DISTINCT si.instructor_name 
-      FROM section_instructors si 
-      WHERE si.instructor_name IS NOT NULL 
-      LIMIT 10
-    `);
-
-    // 2. Check sample names from rmp_cleaned
-    const [rmpSample] = await pool.execute(`
-      SELECT DISTINCT full_name, avg_rating, avg_difficulty, num_ratings 
-      FROM rmp_cleaned 
-      WHERE full_name IS NOT NULL 
-      LIMIT 10
-    `);
-
-    // 3. Check for exact matches
-    const [exactMatches] = await pool.execute(`
-      SELECT si.instructor_name, rmp.full_name, rmp.avg_rating, rmp.avg_difficulty
-      FROM section_instructors si
-      INNER JOIN rmp_cleaned rmp ON si.instructor_name = rmp.full_name
-      LIMIT 10
-    `);
-
-    // 4. Test the new section-level RMP calculation
-    const [sectionRmpTest] = await pool.execute(`
-      WITH section_rmp_avg AS (
-        SELECT 
-          sections.section_id,
-          sections.course_id,
-          CASE 
-            WHEN COUNT(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL THEN 1 END) > 0 
-            THEN ROUND(
-              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
-                  THEN rmp_cleaned.avg_rating * COALESCE(rmp_cleaned.num_ratings, 1) 
-                  ELSE 0 END) / 
-              SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
-                  THEN COALESCE(rmp_cleaned.num_ratings, 1) 
-                  ELSE 0 END), 2)
-            ELSE NULL 
-          END as section_avg_rating,
-          SUM(CASE WHEN rmp_cleaned.avg_rating IS NOT NULL 
-              THEN COALESCE(rmp_cleaned.num_ratings, 1) 
-              ELSE 0 END) as section_total_ratings
-        FROM sections
-        LEFT JOIN section_instructors si ON sections.section_id = si.section_id
-        LEFT JOIN rmp_cleaned ON si.instructor_name = rmp_cleaned.full_name
-        GROUP BY sections.section_id, sections.course_id
-        HAVING section_avg_rating IS NOT NULL
-      )
-      SELECT * FROM section_rmp_avg 
-      WHERE section_avg_rating >= 3.0 
-      LIMIT 10
-    `);
-
-    return c.json({
-      instructor_sample: instructorSample,
-      rmp_sample: rmpSample,
-      exact_matches: exactMatches,
-      section_rmp_calculation_test: sectionRmpTest,
-      debug_info: {
-        total_instructors: instructorSample.length,
-        total_rmp_records: rmpSample.length,
-        exact_matches_found: exactMatches.length,
-        sections_with_rmp_data: sectionRmpTest.length
-      }
-    });
-
-  } catch (error) {
-    console.error("Debug error:", error);
-    return c.json({ error: error.message }, 500);
-  }
-});
-
-app.get("/api/query/test", async (c) => {
-  const apiKey = c.req.header("x-api-key");
-  if (!apiKey || apiKey !== Bun.env.GET_API_KEY) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-  
 });
 
 // Health check endpoint
