@@ -340,7 +340,8 @@ app.get("/api/query", async (c) => {
              literature, level, 
                CAST(madgrades_course_grades.cumulative_gpa AS FLOAT) AS cumulative_gpa,
               CAST(madgrades_course_grades.most_recent_gpa AS FLOAT) AS most_recent_gpa,
-              CAST(madgrades_course_grades.most_recent_gpa AS FLOAT) AS most_recent_gpa
+              CAST(madgrades_course_grades.most_recent_gpa AS FLOAT) AS most_recent_gpa,
+              madgrades_course_grades.course_uuid AS madgrades_course_uuid
 
       FROM courses 
       JOIN madgrades_course_grades ON courses.course_designation = madgrades_course_grades.course_name
